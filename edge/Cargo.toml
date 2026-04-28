@@ -1,0 +1,53 @@
+[package]
+name        = "edge-capture"
+version     = "0.1.0"
+edition     = "2024"
+description = "Multi-camera USB capture agent — records to MCAP (Foxglove-compatible)"
+
+# ── Binaries ─────────────────────────────────────────────────────────────── #
+[[bin]]
+name = "capture"
+path = "src/main.rs"
+
+[[bin]]
+name = "list-cameras"
+path = "src/bin/list_cameras.rs"
+
+# ── Dependencies ─────────────────────────────────────────────────────────── #
+[dependencies]
+
+# V4L2 camera capture (Linux)
+v4l = "0.14"
+
+# MCAP recording format (Foxglove official Rust crate)
+mcap = "0.9"
+
+# Config / serialisation
+serde       = { version = "1", features = ["derive"] }
+serde_yaml  = "0.9"
+serde_json  = "1"
+
+# Unique session IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Multi-producer → single-consumer channel (camera threads → writer thread)
+crossbeam-channel = "0.5"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Structured logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Error handling
+anyhow = "1"
+
+# JPEG encoding for YUYV fallback frames (pure-Rust, no external libs)
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+# Timestamps in manifest JSON
+chrono = { version = "0.4", features = ["serde"] }
+
+# SIGINT / SIGTERM handler
+ctrlc = { version = "3", features = ["termination"] }

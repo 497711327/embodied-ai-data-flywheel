@@ -1,0 +1,44 @@
+# Multi-camera capture configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Run device discovery first to find which /dev/videoN indices are available:
+#
+#   python tools/cli/list_cameras.py
+#
+# Then update device_id below accordingly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+session:
+  output_dir: data/raw      # MCAP files land under data/raw/<YYYYMMDD>/<uuid>/
+  tags:
+    location: ""            # e.g. parking_lot, warehouse, campus
+    weather: ""             # e.g. sunny, overcast, rain
+    operator: ""            # person running the session
+
+cameras:
+  # ── Camera 0 : front ────────────────────────────────────────────────────
+  - name: camera_front
+    device_id: 0
+    width: 1280
+    height: 720
+    fps: 30
+    jpeg_quality: 90        # 1–100. Lower = smaller MCAP, less detail.
+    buffer_size: 4          # Frames held in queue between capture and writer.
+                            # Increase if write spikes cause drops.
+
+  # ── Camera 1 : left (uncomment when a second device is available) ────────
+  # - name: camera_left
+  #   device_id: 2          # USB cameras usually expose even indices (0,2,4…)
+  #   width: 1280
+  #   height: 720
+  #   fps: 30
+  #   jpeg_quality: 90
+  #   buffer_size: 4
+
+  # ── Camera 2 : rear (lower resolution, lower FPS) ────────────────────────
+  # - name: camera_rear
+  #   device_id: 4
+  #   width: 640
+  #   height: 480
+  #   fps: 15
+  #   jpeg_quality: 85
+  #   buffer_size: 4
