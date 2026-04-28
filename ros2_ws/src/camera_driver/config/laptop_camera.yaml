@@ -1,0 +1,8 @@
+cameras:
+  laptop_camera:
+    device_id: 0
+    frame_id: camera_front
+    topic: /camera/front/image_raw
+    fps: 30
+    width: 640
+    height: 480
