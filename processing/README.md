@@ -7,7 +7,7 @@
 | 目录 | 工业级职责 |
 | --- | --- |
 | `jobs/` | Spark / Ray / Flink 批 & 流作业，统一以 Argo Workflows / Airflow 编排 |
-| `decoders/` | MCAP / rosbag → Parquet / Tensor / image shard；点云去畸变；图像去 bayer / ISP |
+| `decoders/` | MCAP → Parquet / Tensor / image shard；点云去畸变；图像去 bayer / ISP |
 | `enrichment/` | 自动标签：场景分类、天气、自车状态、感知伪标签、文本场景描述（VLM） |
 | `mining/` | Corner case 挖掘：感知失败、规划接管、跟车异常、OOD 检测、文本/语义检索 |
 | `sampling/` | 主动学习采样：不确定性、多样性（Coreset）、平衡稀有类别 |

@@ -1,8 +1,7 @@
 # edge/ — 车端 / 机端采集运行时
 
 负责在车 / 机器人本地完成"传感器接入 → 时间同步 → 录制 → 触发 → 缓冲 → 上行 → OTA"。
-不强绑定 ROS2：可以用纯 C++/Rust 实现，也可以用 ROS2 / Cyclone DDS / Zenoh，按硬件平台选。
-本仓库的 [`ros2_ws/`](../ros2_ws) 是其中一种实现示例（笔记本/开发板上跑 ROS2 Humble）。
+运行时以 C++ / Rust / Python 为主，中间件按需选型（Cyclone DDS / Zenoh / eCAL / 自研 IPC），不依赖 ROS。
 
 ## 子目录
 
@@ -10,7 +9,7 @@
 | --- | --- |
 | `agents/` | 设备侧主进程（Vehicle Agent / Robot Agent），生命周期、配置拉取、上行调度、心跳 |
 | `drivers/` | 传感器抽象层：camera / lidar / radar / imu / gnss / can / 力矩 / 触觉，统一 `SensorFrame` 接口 |
-| `recorder/` | 高性能录制器，建议 MCAP；分段、压缩（zstd）、按 topic 分流、按事件触发分包 |
+| `recorder/` | 高性能录制器，推荐 MCAP；分段、压缩（zstd）、按 channel 分流、按事件触发分包 |
 | `triggers/` | 事件触发录制：硬刹、TOR、规划失败、感知不一致、长尾场景规则、模型不确定度 |
 | `sync/` | 时间同步：PTP/IEEE-1588、PPS、硬件触发、driver 内部 sync queue |
 | `buffer/` | Store-and-forward 环形缓冲；断网续传、磁盘配额、优先级队列 |
@@ -20,9 +19,9 @@
 
 ## 工业级实践要点
 
-1. **录制格式选 MCAP**：自描述 schema、自带索引、跨语言支持好，比 rosbag2 更适合大规模数据湖。
+1. **录制格式选 MCAP**：自描述 schema、自带索引、跨语言支持好，是跨平台采集的事实标准。
 2. **Trigger 优先于全量录制**：长尾场景靠规则 + 模型不确定度抓取，而不是 7×24 全录。
-3. **数据上行不走 ROS topic**：用独立上行进程读 MCAP 分段，gRPC + 分块 + 断点续传，避免影响实时链路。
+3. **数据上行与实时控制面隔离**：独立上行进程读 MCAP 分段，gRPC + 分块 + 断点续传，不抢实时总线。
 4. **配置驱动**：传感器布局 / topic / 外参 / 触发规则全部配置化，配置带版本和 hash，写入每段数据的 metadata。
 5. **隐私从端侧开始**：合规要求高的场景（欧盟 GDPR、车队人脸）必须在出车前完成脱敏。
 6. **可观测**：每条 session 在端侧就生成 trace ID，向云端 OTel collector 汇报采集质量指标。

@@ -7,7 +7,7 @@
 
 ```text
 data-flywheel/
-├── edge/         # 车端 / 机端采集运行时（C++/Rust/Python，可选 ROS2）
+├── edge/         # 车端 / 机端采集运行时（C++ / Rust / Python）
 ├── ingestion/    # 上行接入：网关、Kafka/Pulsar、Schema Registry
 ├── storage/      # 数据湖：对象存储 + Iceberg/Delta + 元数据/血缘
 ├── processing/   # ETL & 数据挖掘：Spark/Ray、解码、增强、Corner Case 挖掘
@@ -17,8 +17,7 @@ data-flywheel/
 ├── feedback/     # 主动学习闭环：失败挖掘、重采集、优先级
 ├── tools/        # 可视化 & 调试：Foxglove、rerun、Dashboards、CLI
 ├── infra/        # Docker / K8s / Terraform / Argo / Observability
-├── docs/         # 架构、数据契约、Runbook、ADR
-└── ros2_ws/      # 一种 edge 实现：ROS2 Humble 工作区（相机驱动等）
+└── docs/         # 架构、数据契约、Runbook、ADR
 ```
 
 ## 整体数据流
@@ -77,7 +76,7 @@ data-flywheel/
 
 ## 关键设计约束
 
-1. **Raw immutable**：原始包（MCAP/rosbag2/parquet）写入对象存储后不可改，所有派生数据通过 lineage 追溯。
+1. **Raw immutable**：原始包（MCAP / Parquet 等）写入对象存储后不可改，所有派生数据通过 lineage 追溯。
 2. **Schema first**：所有跨服务消息先在 `ingestion/schemas/` 定义，再写代码；Schema Registry 强制兼容性。
 3. **Session 是一等公民**：每段数据都属于一个 `session_id`，绑定车/机器人 ID、传感器配置 hash、标定版本、git commit、地图版本、天气、场景标签。
 4. **数据湖分层**：raw → bronze（解码）→ silver（对齐+特征）→ gold（训练就绪）。
@@ -104,8 +103,8 @@ data-flywheel/
 
 | 层 | 工业级常见选型 |
 | --- | --- |
-| edge runtime | C++ / Rust，可选 ROS2 Humble、Cyclone DDS、Zenoh |
-| 录制格式 | MCAP（推荐）、rosbag2、Parquet |
+| edge runtime | C++ / Rust / Python，DDS 中间件可选 Cyclone DDS、Zenoh、eCAL |
+| 录制格式 | MCAP（推荐）、Parquet |
 | 上行 | gRPC + 分块 + 断点续传 + 预签名 URL |
 | 流 | Kafka / Pulsar + Schema Registry（Avro / Protobuf） |
 | 对象存储 | S3 / GCS / OSS / MinIO |
