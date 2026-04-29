@@ -72,7 +72,10 @@ impl McapWriter {
 
     /// Register a camera channel. Must be called before the first frame.
     /// Calling again with the same name is a no-op.
-    pub fn register_camera(&mut self, name: &str) -> Result<()> {
+    ///
+    /// `clock_source` is written into the MCAP channel metadata so that
+    /// downstream readers know the time domain (e.g. `"CLOCK_TAI/PTP"`).
+    pub fn register_camera(&mut self, name: &str, clock_source: &str) -> Result<()> {
         if self.channels.contains_key(name) {
             return Ok(());
         }
@@ -83,10 +86,13 @@ impl McapWriter {
             data: Cow::Borrowed(COMPRESSED_IMAGE_SCHEMA),
         });
 
+        let mut metadata = BTreeMap::new();
+        metadata.insert("clock_source".to_string(), clock_source.to_string());
+
         let channel = Arc::new(mcap::Channel {
             topic: format!("/camera/{}/compressed", name),
             message_encoding: "json".to_string(),
-            metadata: BTreeMap::new(),
+            metadata,
             schema: Some(schema),
         });
 
@@ -103,7 +109,7 @@ impl McapWriter {
             Some(c) => Arc::clone(c),
             None => {
                 // Auto-register on first sight (shouldn't happen in normal use)
-                self.register_camera(&frame.camera_name)?;
+                self.register_camera(&frame.camera_name, "unknown")?;
                 Arc::clone(self.channels.get(&frame.camera_name).unwrap())
             }
         };

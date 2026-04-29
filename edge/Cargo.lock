@@ -382,6 +382,7 @@ dependencies = [
  "ctrlc",
  "image",
  "mcap",
+ "nix",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -11,6 +11,7 @@
 mod config;
 mod drivers;
 mod recorder;
+mod time;
 
 use std::{
     path::PathBuf,
@@ -31,6 +32,7 @@ use recorder::{
     mcap_writer::McapWriter,
     session::{SensorInfo, SessionManager},
 };
+use time::ClockCalibration;
 
 // ── CLI ───────────────────────────────────────────────────────────────────── //
 
@@ -67,6 +69,11 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // ── Clock calibration (PTP / CLOCK_TAI) ──────────────────────────────── //
+    // Must happen before opening cameras so every thread shares the same
+    // MONO→TAI reference epoch.
+    let calibration = std::sync::Arc::new(ClockCalibration::measure());
 
     // ── Load config ─────────────────────────────────────────────────────── //
 
@@ -111,7 +118,7 @@ fn main() -> Result<()> {
     for cam_cfg in cfg.cameras {
         match UsbCamera::open(cam_cfg.clone()) {
             Ok(cam) => {
-                writer.register_camera(&cam_cfg.name)?;
+                writer.register_camera(&cam_cfg.name, calibration.clock_label)?;
                 sensor_infos.push(SensorInfo {
                     name: cam.config().name.clone(),
                     device_id: cam.config().device_id,
@@ -123,9 +130,10 @@ fn main() -> Result<()> {
 
                 let tx2 = tx.clone();
                 let stop2 = Arc::clone(&stop);
+                let cal2  = Arc::clone(&calibration);
                 let handle = std::thread::Builder::new()
                     .name(format!("cam-{}", cam.config().name))
-                    .spawn(move || cam.run(tx2, stop2))?;
+                    .spawn(move || cam.run(tx2, stop2, cal2))?;
                 camera_handles.push(handle);
             }
             Err(e) => {
@@ -215,7 +223,15 @@ fn main() -> Result<()> {
     let total_frame_bytes = writer.total_frame_bytes();
     writer.close()?;
 
-    session.finalize(&mcap_path, total_frames, total_frame_bytes, sensor_infos)?;
+    session.finalize(
+        &mcap_path,
+        total_frames,
+        total_frame_bytes,
+        sensor_infos,
+        calibration.clock_label,
+        calibration.ptp_synced,
+        calibration.mono_to_tai_offset_ns,
+    )?;
 
     Ok(())
 }

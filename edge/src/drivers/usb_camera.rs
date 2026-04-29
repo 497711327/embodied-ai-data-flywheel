@@ -7,12 +7,9 @@
 //! Format negotiation order: MJPG (camera produces JPEG, zero re-encode) →
 //! YUYV (soft-encode to JPEG via the `image` crate).
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::{SystemTime, UNIX_EPOCH},
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 use anyhow::{Context, Result};
@@ -24,7 +21,7 @@ use v4l::{
     Device, FourCC,
 };
 
-use crate::config::CameraConfig;
+use crate::{config::CameraConfig, time::ClockCalibration};
 
 // ── Public frame type ────────────────────────────────────────────────────── //
 
@@ -33,7 +30,12 @@ use crate::config::CameraConfig;
 pub struct CameraFrame {
     pub camera_name: String,
     pub device_id: u32,
-    /// Wall-clock nanoseconds since Unix epoch.
+    /// CLOCK_TAI nanoseconds at the moment the frame was **captured by the
+    /// kernel driver** (V4L2 buffer metadata timestamp, converted from
+    /// CLOCK_MONOTONIC via [`ClockCalibration`]).
+    ///
+    /// This is set at frame-capture time, not at userspace dequeue time,
+    /// eliminating USB-transfer and scheduling jitter.
     pub timestamp_ns: u64,
     pub frame_index: u64,
     pub width: u32,
@@ -155,10 +157,15 @@ impl UsbCamera {
     /// Sends [`CameraFrame`]s via `tx`. Returns total captured frame count.
     /// Frames are silently dropped when the channel is full (back-pressure from
     /// a slow writer) — a warning is logged per dropped frame.
+    ///
+    /// `calibration` converts V4L2 CLOCK_MONOTONIC hardware timestamps to
+    /// CLOCK_TAI. Pass the same `Arc<ClockCalibration>` to every camera so
+    /// all streams share a single reference epoch.
     pub fn run(
         self,
         tx: crossbeam_channel::Sender<CameraFrame>,
         stop: Arc<AtomicBool>,
+        calibration: Arc<ClockCalibration>,
     ) -> Result<u64> {
         let mut stream =
             Stream::with_buffers(&self.device, Type::VideoCapture, self.config.buffer_size)
@@ -176,7 +183,7 @@ impl UsbCamera {
 
         while !stop.load(Ordering::Relaxed) {
             // stream.next() blocks until a frame is ready (typically < 33 ms).
-            let (buf, _meta) = match stream.next() {
+            let (buf, meta) = match stream.next() {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(camera = %name, "Frame read error: {e}");
@@ -184,11 +191,19 @@ impl UsbCamera {
                 }
             };
 
-            // Use wall clock so all cameras share the same time reference.
-            let timestamp_ns = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
+            // ── Hardware timestamp (kernel driver, CLOCK_MONOTONIC) ────────
+            // V4L2 sets this at the moment the frame DMA completes — before
+            // the buffer is dequeued to userspace.  This eliminates USB
+            // transfer latency and thread-scheduling jitter that would affect
+            // a userspace SystemTime::now() call.
+            let hw_sec  = meta.timestamp.sec  as u64;
+            let hw_usec = meta.timestamp.usec as u64;
+            let hw_mono_ns = hw_sec * 1_000_000_000 + hw_usec * 1_000;
+
+            // Convert CLOCK_MONOTONIC → CLOCK_TAI using the pre-measured
+            // offset.  All cameras share the same CalibrationCalibration so
+            // their timestamps are directly comparable.
+            let timestamp_ns = calibration.mono_to_tai(hw_mono_ns);
 
             let data: Vec<u8> = if is_mjpg {
                 buf.to_vec() // already JPEG

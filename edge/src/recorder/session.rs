@@ -34,6 +34,12 @@ pub struct SessionManifest {
     pub total_frame_bytes: usize,
     pub sensors: Vec<SensorInfo>,
     pub tags: HashMap<String, String>,
+    /// Clock domain used for all frame timestamps (e.g. `"CLOCK_TAI/PTP"`).
+    pub clock_source: String,
+    /// Whether `ptp4l` was detected running at session start.
+    pub ptp_synced: bool,
+    /// CLOCK_MONOTONIC → CLOCK_TAI offset applied to V4L2 hardware timestamps (ns).
+    pub mono_to_tai_offset_ns: i64,
 }
 
 // ── SessionManager ────────────────────────────────────────────────────────── //
@@ -81,6 +87,9 @@ impl SessionManager {
         total_frames: u64,
         total_frame_bytes: usize,
         sensors: Vec<SensorInfo>,
+        clock_source: &str,
+        ptp_synced: bool,
+        mono_to_tai_offset_ns: i64,
     ) -> Result<()> {
         let ended_at = Utc::now();
 
@@ -99,6 +108,9 @@ impl SessionManager {
             total_frame_bytes,
             sensors,
             tags: self.tags.clone(),
+            clock_source: clock_source.to_string(),
+            ptp_synced,
+            mono_to_tai_offset_ns,
         };
 
         let manifest_path = self.session_dir.join("session.manifest.json");
