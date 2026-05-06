@@ -9,6 +9,8 @@
 
 session:
   output_dir: data/raw      # MCAP files land under data/raw/<YYYYMMDD>/<uuid>/
+  duration: 0               # Total recording seconds. 0 = run until Ctrl-C.
+  segment_duration: 30      # Split MCAP every N seconds (0 = no splitting, single file).
   tags:
     location: ""            # e.g. parking_lot, warehouse, campus
     weather: ""             # e.g. sunny, overcast, rain
@@ -42,3 +44,22 @@ cameras:
   #   fps: 15
   #   jpeg_quality: 85
   #   buffer_size: 4
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UDP streams — captured into the same MCAP file alongside camera frames.
+# Topic in MCAP: /udp/<name>/raw
+# Timestamp (ms since epoch) is stored in the MCAP log_time field for sync.
+# ─────────────────────────────────────────────────────────────────────────────
+
+udp_streams:
+  # ── Radar front UDP ──────────────────────────────────────────────────────
+  - name: radar_front
+    bind_ip: "192.168.225.14"
+    port: 5003
+    # multicast_group: "239.1.1.1"  # Uncomment to join multicast
+    # buffer_size: 8                  # Channel queue depth (default: 8)
+
+  # ── Example: second stream on different port ─────────────────────────────
+  # - name: radar_rear
+  #   bind_ip: "0.0.0.0"
+  #   port: 5001

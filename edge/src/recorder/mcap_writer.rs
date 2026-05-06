@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use tracing::debug;
 
 use crate::drivers::usb_camera::CameraFrame;
+use crate::drivers::udp_capture::UdpFrame;
 
 // ── foxglove.CompressedImage JSON schema ─────────────────────────────────── //
 
@@ -39,6 +40,24 @@ const COMPRESSED_IMAGE_SCHEMA: &[u8] = br#"{
     "frame_id": { "type": "string" },
     "data":     { "type": "string", "contentEncoding": "base64" },
     "format":   { "type": "string" }
+  }
+}"#;
+
+/// JSON Schema for raw UDP packets stored in MCAP.
+const RAW_UDP_SCHEMA: &[u8] = br#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RawUdpPacket",
+  "type": "object",
+  "properties": {
+    "timestamp": {
+      "type": "object",
+      "properties": {
+        "sec":  { "type": "integer" },
+        "nsec": { "type": "integer" }
+      }
+    },
+    "stream_name": { "type": "string" },
+    "data":        { "type": "string", "contentEncoding": "base64" }
   }
 }"#;
 
@@ -99,6 +118,80 @@ impl McapWriter {
         self.channels.insert(name.to_string(), channel);
         self.sequences.insert(name.to_string(), 0);
         debug!(camera = %name, "MCAP channel registered");
+        Ok(())
+    }
+
+    /// Register a UDP stream channel. Must be called before the first UDP frame.
+    pub fn register_udp_stream(&mut self, name: &str) -> Result<()> {
+        let key = format!("udp_{}", name);
+        if self.channels.contains_key(&key) {
+            return Ok(());
+        }
+
+        let schema = Arc::new(mcap::Schema {
+            name: "RawUdpPacket".to_string(),
+            encoding: "jsonschema".to_string(),
+            data: Cow::Borrowed(RAW_UDP_SCHEMA),
+        });
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("source".to_string(), "udp_capture".to_string());
+
+        let channel = Arc::new(mcap::Channel {
+            topic: format!("/udp/{}/raw", name),
+            message_encoding: "json".to_string(),
+            metadata,
+            schema: Some(schema),
+        });
+
+        self.channels.insert(key.clone(), channel);
+        self.sequences.insert(key, 0);
+        debug!(udp_stream = %name, "MCAP UDP channel registered");
+        Ok(())
+    }
+
+    /// Write a UDP frame into the MCAP file.
+    /// Timestamp (ms) is stored in the first 8 bytes of the stream for
+    /// synchronization with camera frames.
+    pub fn write_udp_frame(&mut self, frame: &UdpFrame) -> Result<()> {
+        let key = format!("udp_{}", frame.stream_name);
+        let channel = match self.channels.get(&key) {
+            Some(c) => Arc::clone(c),
+            None => {
+                self.register_udp_stream(&frame.stream_name)?;
+                Arc::clone(self.channels.get(&key).unwrap())
+            }
+        };
+
+        let seq = self.sequences.get_mut(&key).unwrap();
+        let cur_seq = *seq;
+        *seq = seq.wrapping_add(1);
+
+        // Convert ms to ns for MCAP log_time.
+        let timestamp_ns = frame.timestamp_ms * 1_000_000;
+        let sec = timestamp_ns / 1_000_000_000;
+        let nsec = timestamp_ns % 1_000_000_000;
+
+        let b64 = base64_encode(&frame.data);
+
+        let payload = serde_json::json!({
+            "timestamp": { "sec": sec, "nsec": nsec },
+            "stream_name": frame.stream_name,
+            "data": b64
+        });
+        let payload_bytes = serde_json::to_vec(&payload).context("JSON encode UDP")?;
+
+        self.writer
+            .write(&mcap::Message {
+                channel,
+                sequence: cur_seq,
+                log_time: timestamp_ns,
+                publish_time: timestamp_ns,
+                data: Cow::Owned(payload_bytes),
+            })
+            .context("MCAP write UDP")?;
+
+        self.total_frame_bytes += frame.data.len();
         Ok(())
     }
 

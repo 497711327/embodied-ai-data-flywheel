@@ -381,6 +381,7 @@ dependencies = [
  "crossbeam-channel",
  "ctrlc",
  "image",
+ "libc",
  "mcap",
  "nix",
  "serde",

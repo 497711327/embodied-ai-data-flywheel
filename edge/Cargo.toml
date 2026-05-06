@@ -49,6 +49,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # Timestamps in manifest JSON
 chrono = { version = "0.4", features = ["serde"] }
 
+# Unix socket options (SO_RCVBUF etc.)
+libc = "0.2"
+
 # SIGINT / SIGTERM handler
 ctrlc = { version = "3", features = ["termination"] }
 

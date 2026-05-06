@@ -28,11 +28,22 @@ use crossbeam_channel::RecvTimeoutError;
 use tracing::{info, warn};
 
 use drivers::usb_camera::UsbCamera;
+use drivers::udp_capture::{UdpCapture, UdpCaptureConfig, UdpFrame};
 use recorder::{
     mcap_writer::McapWriter,
     session::{SensorInfo, SessionManager},
 };
 use time::ClockCalibration;
+
+// ── Unified message for the writer channel ───────────────────────────────── //
+
+use drivers::usb_camera::CameraFrame;
+
+/// Messages sent from capture threads (camera or UDP) to the writer loop.
+enum CaptureMessage {
+    Camera(CameraFrame),
+    Udp(UdpFrame),
+}
 
 // ── CLI ───────────────────────────────────────────────────────────────────── //
 
@@ -48,9 +59,13 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Stop after this many seconds (omit to run until Ctrl-C).
+    /// Stop after this many seconds (overrides config session.duration).
     #[arg(short, long)]
     duration: Option<f64>,
+
+    /// Split MCAP every N seconds (overrides config session.segment_duration).
+    #[arg(short, long)]
+    segment_duration: Option<f64>,
 
     /// Extra metadata tags burned into the session manifest (key=value).
     #[arg(short, long = "tag", value_name = "KEY=VALUE")]
@@ -93,21 +108,35 @@ fn main() -> Result<()> {
         .or(cfg.session.output_dir.clone())
         .unwrap_or_else(|| PathBuf::from("data/raw"));
 
+    // Resolve recording duration: CLI > YAML > infinite (0).
+    let duration_secs = args.duration.unwrap_or(cfg.session.duration);
+    let duration_limit = if duration_secs > 0.0 { Some(duration_secs) } else { None };
+
+    // Resolve segment duration: CLI > YAML > no splitting (0).
+    let segment_secs = args.segment_duration.unwrap_or(cfg.session.segment_duration);
+    let segment_limit = if segment_secs > 0.0 { Some(segment_secs) } else { None };
+
     let session = SessionManager::new(output_dir, tags);
     session.create_dir()?;
 
-    let mcap_path = session.session_dir().join("recording.mcap");
+    let mcap_path = if segment_limit.is_some() {
+        session.session_dir().join("recording_0000.mcap")
+    } else {
+        session.session_dir().join("recording.mcap")
+    };
 
     info!(session_id = %session.session_id, path = %mcap_path.display(), "Session started");
 
     // ── Open cameras ─────────────────────────────────────────────────────── //
 
     let mut camera_handles = Vec::new();
+    let mut aux_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut sensor_infos: Vec<SensorInfo> = Vec::new();
 
-    // Bounded channel: at most (8 × camera count) frames queued.
-    let channel_cap = cfg.cameras.len().max(1) * 8;
-    let (tx, rx) = crossbeam_channel::bounded(channel_cap);
+    // Bounded channel: at most (8 × (camera + udp stream) count) messages queued.
+    let total_sources = cfg.cameras.len().max(1) + cfg.udp_streams.len();
+    let channel_cap = total_sources * 8;
+    let (tx, rx) = crossbeam_channel::bounded::<CaptureMessage>(channel_cap);
 
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -115,7 +144,7 @@ fn main() -> Result<()> {
 
     let mut writer = McapWriter::new(&mcap_path)?;
 
-    for cam_cfg in cfg.cameras {
+    for cam_cfg in &cfg.cameras {
         match UsbCamera::open(cam_cfg.clone()) {
             Ok(cam) => {
                 writer.register_camera(&cam_cfg.name, calibration.clock_label)?;
@@ -128,13 +157,35 @@ fn main() -> Result<()> {
                     actual_fps: cam.actual_fps(),
                 });
 
+                // Camera thread sends CameraFrame wrapped in CaptureMessage.
+                let (cam_tx, cam_rx) = crossbeam_channel::bounded::<CameraFrame>(8);
                 let tx2 = tx.clone();
                 let stop2 = Arc::clone(&stop);
                 let cal2  = Arc::clone(&calibration);
-                let handle = std::thread::Builder::new()
-                    .name(format!("cam-{}", cam.config().name))
-                    .spawn(move || cam.run(tx2, stop2, cal2))?;
-                camera_handles.push(handle);
+
+                // Spawm camera capture thread.
+                let cam_name = cam.config().name.clone();
+                let cam_handle = std::thread::Builder::new()
+                    .name(format!("cam-{}", cam_name))
+                    .spawn(move || cam.run(cam_tx, stop2, cal2))?;
+                camera_handles.push(cam_handle);
+
+                // Bridge thread: forward CameraFrame → CaptureMessage::Camera.
+                let stop3 = Arc::clone(&stop);
+                let bridge_handle = std::thread::Builder::new()
+                    .name(format!("bridge-cam-{}", cam_name))
+                    .spawn(move || {
+                        while !stop3.load(Ordering::Relaxed) {
+                            match cam_rx.recv_timeout(Duration::from_millis(100)) {
+                                Ok(frame) => {
+                                    let _ = tx2.try_send(CaptureMessage::Camera(frame));
+                                }
+                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                    })?;
+                aux_handles.push(bridge_handle);
             }
             Err(e) => {
                 warn!("Skipping camera '{}': {:#}", cam_cfg.name, e);
@@ -142,15 +193,74 @@ fn main() -> Result<()> {
         }
     }
 
-    // Drop the main-thread sender: when all camera threads exit and drop their
+    // ── Open UDP streams ──────────────────────────────────────────────────── //
+
+    let mut udp_handles = Vec::new();
+
+    for udp_cfg in &cfg.udp_streams {
+        let capture_cfg = UdpCaptureConfig {
+            name: udp_cfg.name.clone(),
+            bind_addr: format!("{}:{}", udp_cfg.bind_ip, udp_cfg.port),
+            multicast_group: udp_cfg.multicast_group.clone(),
+            interface: None,
+        };
+
+        match UdpCapture::open(capture_cfg) {
+            Ok(capture) => {
+                writer.register_udp_stream(&udp_cfg.name)?;
+
+                let tx2 = tx.clone();
+                let stop2 = Arc::clone(&stop);
+                let stream_name = udp_cfg.name.clone();
+
+                let handle = std::thread::Builder::new()
+                    .name(format!("udp-{}", stream_name))
+                    .spawn(move || {
+                        // Create a local channel for the capture, then forward.
+                        let (udp_tx, udp_rx) = crossbeam_channel::bounded::<UdpFrame>(64);
+
+                        // Spawn inner capture thread.
+                        let stop3 = Arc::clone(&stop2);
+                        let inner = std::thread::Builder::new()
+                            .name(format!("udp-rx-{}", stream_name))
+                            .spawn(move || capture.run_to_channel(udp_tx, stop3))
+                            .expect("spawn udp rx thread");
+
+                        // Forward loop.
+                        while !stop2.load(Ordering::Relaxed) {
+                            match udp_rx.recv_timeout(Duration::from_millis(100)) {
+                                Ok(frame) => {
+                                    let _ = tx2.try_send(CaptureMessage::Udp(frame));
+                                }
+                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        let _ = inner.join();
+                    })?;
+                udp_handles.push(handle);
+
+                info!(name = %udp_cfg.name, port = udp_cfg.port, "UDP stream capture started");
+            }
+            Err(e) => {
+                warn!("Skipping UDP stream '{}': {:#}", udp_cfg.name, e);
+            }
+        }
+    }
+
+    // Drop the main-thread sender: when all capture threads exit and drop their
     // senders, `rx.recv()` will return `Disconnected`.
     drop(tx);
 
-    if camera_handles.is_empty() {
-        anyhow::bail!("No cameras could be opened. Exiting.");
+    if camera_handles.is_empty() && udp_handles.is_empty() {
+        anyhow::bail!("No cameras or UDP streams could be opened. Exiting.");
     }
 
-    info!(cameras = camera_handles.len(), "Recording started — press Ctrl-C to stop");
+    info!(
+        cameras = camera_handles.len(),
+        udp_streams = udp_handles.len(),
+        "Recording started — press Ctrl-C to stop"
+    );
 
     // ── Signal handling ───────────────────────────────────────────────────── //
 
@@ -164,10 +274,12 @@ fn main() -> Result<()> {
 
     let t_start = Instant::now();
     let mut total_frames: u64 = 0;
+    let mut segment_index: u32 = 0;
+    let mut segment_start = Instant::now();
 
     loop {
         // Duration limit check
-        if let Some(dur) = args.duration {
+        if let Some(dur) = duration_limit {
             if t_start.elapsed().as_secs_f64() >= dur {
                 info!("Duration limit reached ({dur:.1}s)");
                 stop.store(true, Ordering::Relaxed);
@@ -175,9 +287,37 @@ fn main() -> Result<()> {
             }
         }
 
+        // Segment splitting: close current MCAP and open a new one.
+        if let Some(seg_dur) = segment_limit {
+            if segment_start.elapsed().as_secs_f64() >= seg_dur {
+                writer.close()?;
+                segment_index += 1;
+                let new_path = session
+                    .session_dir()
+                    .join(format!("recording_{:04}.mcap", segment_index));
+                writer = McapWriter::new(&new_path)?;
+                // Re-register channels in the new segment file.
+                for cam_cfg in &cfg.cameras {
+                    let _ = writer.register_camera(&cam_cfg.name, calibration.clock_label);
+                }
+                for udp_cfg in &cfg.udp_streams {
+                    let _ = writer.register_udp_stream(&udp_cfg.name);
+                }
+                info!(segment = segment_index, path = %new_path.display(), "New MCAP segment");
+                segment_start = Instant::now();
+            }
+        }
+
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(frame) => {
-                writer.write_frame(&frame)?;
+            Ok(msg) => {
+                match msg {
+                    CaptureMessage::Camera(frame) => {
+                        writer.write_frame(&frame)?;
+                    }
+                    CaptureMessage::Udp(frame) => {
+                        writer.write_udp_frame(&frame)?;
+                    }
+                }
                 total_frames += 1;
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -186,7 +326,7 @@ fn main() -> Result<()> {
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                // All camera threads exited and dropped their senders.
+                // All capture threads exited and dropped their senders.
                 break;
             }
         }
@@ -199,10 +339,26 @@ fn main() -> Result<()> {
         let _ = handle.join();
     }
 
-    // Drain any frames still in the channel (cameras may have batched a few
-    // frames before seeing the stop flag).
-    while let Ok(frame) = rx.try_recv() {
-        writer.write_frame(&frame)?;
+    // Wait for all auxiliary (bridge) threads to finish.
+    for handle in aux_handles {
+        let _ = handle.join();
+    }
+
+    // Wait for all UDP threads to finish.
+    for handle in udp_handles {
+        let _ = handle.join();
+    }
+
+    // Drain any messages still in the channel.
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            CaptureMessage::Camera(frame) => {
+                writer.write_frame(&frame)?;
+            }
+            CaptureMessage::Udp(frame) => {
+                writer.write_udp_frame(&frame)?;
+            }
+        }
         total_frames += 1;
     }
 
