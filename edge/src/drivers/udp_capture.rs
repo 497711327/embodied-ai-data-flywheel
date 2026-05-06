@@ -61,6 +61,9 @@ impl UdpCapture {
         let socket = UdpSocket::bind(&config.bind_addr)
             .with_context(|| format!("Failed to bind UDP socket to {}", config.bind_addr))?;
 
+        // Enable receiving broadcast packets.
+        socket.set_broadcast(true)?;
+
         // Set receive buffer to 8 MB to reduce kernel drops.
         set_recv_buffer(&socket, 8 * 1024 * 1024);
 
