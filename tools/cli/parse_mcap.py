@@ -10,6 +10,7 @@ info        Print session summary: topics, frame counts, time range, clock sourc
 frames      Dump every frame as a JPEG file.
 video       Re-encode each camera channel into an MP4 (requires opencv).
 udp         Print or extract raw UDP packets from /udp/<name>/raw topics.
+phoenix     One-shot export for Phoenix replay (cameraXX.mp4 + .mudp).
 
 Usage
 -----
@@ -22,11 +23,17 @@ Usage
     # Re-encode to MP4 (one per camera)
     python tools/cli/parse_mcap.py video recording.mcap [--fps 30] [--out ./video]
 
+    # Re-encode with Phoenix-compatible naming (camera01.mp4, camera02.mp4...)
+    python tools/cli/parse_mcap.py video recording.mcap --phoenix-naming --out ./video
+
     # Inspect UDP packets
     python tools/cli/parse_mcap.py udp recording.mcap [--stream radar_front] [--limit 20]
 
     # Extract UDP payloads as .mudp files (one per stream)
     python tools/cli/parse_mcap.py udp recording.mcap --out ./mudp
+
+    # One-shot Phoenix export (video + mudp)
+    python tools/cli/parse_mcap.py phoenix recording.mcap --out ./phoenix_bundle
 """
 
 from __future__ import annotations
@@ -279,12 +286,15 @@ def cmd_video(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     camera_filter: str | None = args.camera
     fps: float = args.fps
+    phoenix_naming: bool = args.phoenix_naming
 
     # Per-camera VideoWriter objects, created lazily on first frame.
     writers: dict[str, cv2.VideoWriter] = {}
     frame_counts: dict[str, int] = {}
     start_times: dict[str, int] = {}
     end_times: dict[str, int] = {}
+    output_names: dict[str, str] = {}
+    camera_order: dict[str, int] = {}
 
     import numpy as np
 
@@ -299,7 +309,16 @@ def cmd_video(args: argparse.Namespace) -> None:
         h, w = frame.shape[:2]
 
         if name not in writers:
-            out_path = str(out_dir / f"{name}.mp4")
+            if name not in camera_order:
+                camera_order[name] = len(camera_order)
+
+            if phoenix_naming:
+                out_name = f"camera{camera_order[name] + 1:02d}.mp4"
+            else:
+                out_name = f"{name}.mp4"
+
+            output_names[name] = out_name
+            out_path = str(out_dir / out_name)
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
             if not writer.isOpened():
@@ -325,8 +344,13 @@ def cmd_video(args: argparse.Namespace) -> None:
         n = frame_counts[name]
         dur_s = (end_times[name] - start_times[name]) / 1e9
         actual_fps = n / dur_s if dur_s > 0 else 0.0
-        out_path = out_dir / f"{name}.mp4"
+        out_path = out_dir / output_names.get(name, f"{name}.mp4")
         print(f"  {name}: {n} frames, {dur_s:.1f}s, {actual_fps:.1f} fps → {out_path}")
+
+    if phoenix_naming and writers:
+        print("\nPhoenix mapping:")
+        for name, idx in sorted(camera_order.items(), key=lambda item: item[1]):
+            print(f"  {name} -> {output_names[name]}")
 
     if not writers:
         print("No image messages found (check --camera filter).")
@@ -367,10 +391,10 @@ def cmd_udp(args: argparse.Namespace) -> None:
                     fh = open(out_path, "wb")
                     mudp_files[name] = fh
 
-                # MudpLogHeader_T: first 8 bytes are timestamp(ms), little-endian.
+                # MudpLogHeader_T: first 8 bytes are timestamp(us), little-endian.
                 # Then append raw UDP bytes; packet headers remain unchanged.
-                ts_ms = ts_ns // 1_000_000
-                fh.write(struct.pack("<Q", ts_ms))
+                ts_us = ts_ns // 1_000
+                fh.write(struct.pack("<Q", ts_us))
                 fh.write(payload)
 
             if max_packets is None or total_packets <= max_packets:
@@ -399,6 +423,42 @@ def cmd_udp(args: argparse.Namespace) -> None:
 
     if out_root:
         print(f"  mudp files written to: {out_root}")
+
+
+def cmd_phoenix(args: argparse.Namespace) -> None:
+    """One-shot export for Phoenix replay assets."""
+    mcap_path = Path(args.mcap)
+    if not mcap_path.exists():
+        print(f"ERROR: file not found: {mcap_path}")
+        sys.exit(1)
+
+    out_root = Path(args.out)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    video_out = out_root / "video"
+    mudp_out = out_root / "udp"
+
+    print("[1/2] Exporting video for Phoenix replay...")
+    cmd_video(argparse.Namespace(
+        mcap=str(mcap_path),
+        camera=args.camera,
+        fps=args.fps,
+        out=str(video_out),
+        phoenix_naming=True,
+    ))
+
+    print("\n[2/2] Exporting UDP as .mudp (timestamp in microseconds)...")
+    cmd_udp(argparse.Namespace(
+        mcap=str(mcap_path),
+        stream=args.stream,
+        limit=0,
+        hex_bytes=0,
+        out=str(mudp_out),
+    ))
+
+    print("\nPhoenix bundle ready:")
+    print(f"  video: {video_out}")
+    print(f"  udp:   {mudp_out}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -431,6 +491,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Output video FPS (default: 30)")
     pv.add_argument("--out", default="./video",
                     help="Output directory (default: ./video)")
+    pv.add_argument("--phoenix-naming", action="store_true",
+                    help="Use Phoenix-style output names (camera01.mp4, camera02.mp4...) for folder replay")
 
     # udp
     pu = sub.add_parser("udp", help="Print or extract raw UDP packets")
@@ -444,6 +506,18 @@ def build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--out", default=None,
                     help="Optional output directory for .mudp files (one per stream)")
 
+    # phoenix
+    pp = sub.add_parser("phoenix", help="One-shot Phoenix export (cameraXX.mp4 + .mudp)")
+    pp.add_argument("mcap", help="Path to .mcap file")
+    pp.add_argument("--camera", metavar="NAME",
+                    help="Only export this camera to video (default: all)")
+    pp.add_argument("--stream", metavar="NAME",
+                    help="Only export this UDP stream to mudp (default: all)")
+    pp.add_argument("--fps", type=float, default=30.0,
+                    help="Output video FPS (default: 30)")
+    pp.add_argument("--out", default="./phoenix_bundle",
+                    help="Output bundle directory (default: ./phoenix_bundle)")
+
     return p
 
 
@@ -456,6 +530,7 @@ def main() -> None:
         "frames": cmd_frames,
         "video":  cmd_video,
         "udp":    cmd_udp,
+        "phoenix": cmd_phoenix,
     }
     dispatch[args.cmd](args)
 
