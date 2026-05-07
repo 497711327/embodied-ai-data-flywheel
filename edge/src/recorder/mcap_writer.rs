@@ -151,8 +151,7 @@ impl McapWriter {
     }
 
     /// Write a UDP frame into the MCAP file.
-    /// Timestamp (ms) is stored in the first 8 bytes of the stream for
-    /// synchronization with camera frames.
+    /// Timestamp is in CLOCK_TAI nanoseconds for synchronization with cameras.
     pub fn write_udp_frame(&mut self, frame: &UdpFrame) -> Result<()> {
         let key = format!("udp_{}", frame.stream_name);
         let channel = match self.channels.get(&key) {
@@ -167,8 +166,7 @@ impl McapWriter {
         let cur_seq = *seq;
         *seq = seq.wrapping_add(1);
 
-        // Convert ms to ns for MCAP log_time.
-        let timestamp_ns = frame.timestamp_ms * 1_000_000;
+        let timestamp_ns = frame.timestamp_ns;
         let sec = timestamp_ns / 1_000_000_000;
         let nsec = timestamp_ns % 1_000_000_000;
 

@@ -45,8 +45,8 @@ pub struct UdpCaptureConfig {
 #[derive(Debug, Clone)]
 pub struct UdpFrame {
     pub stream_name: String,
-    /// Milliseconds since UNIX epoch when the packet was received.
-    pub timestamp_ms: u64,
+    /// Nanoseconds since UNIX epoch in CLOCK_TAI domain.
+    pub timestamp_ns: u64,
     /// Raw UDP payload bytes.
     pub data: Vec<u8>,
 }
@@ -133,12 +133,11 @@ impl UdpCapture {
 
             // Kernel RX timestamps are CLOCK_REALTIME. Convert to the same
             // CLOCK_TAI domain used by camera frames for cross-sensor alignment.
-            let timestamp_tai_ns = realtime_ns_to_tai_ns(recv_rt_ns, self.realtime_to_tai_offset_ns);
-            let timestamp_ms = timestamp_tai_ns / 1_000_000;
+            let timestamp_ns = realtime_ns_to_tai_ns(recv_rt_ns, self.realtime_to_tai_offset_ns);
 
             let frame = UdpFrame {
                 stream_name: self.config.name.clone(),
-                timestamp_ms,
+                timestamp_ns,
                 data: recv_buf[..n].to_vec(),
             };
 
