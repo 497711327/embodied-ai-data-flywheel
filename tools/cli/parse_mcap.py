@@ -9,6 +9,7 @@ Modes
 info        Print session summary: topics, frame counts, time range, clock source.
 frames      Dump every frame as a JPEG file.
 video       Re-encode each camera channel into an MP4 (requires opencv).
+udp         Print or extract raw UDP packets from /udp/<name>/raw topics.
 
 Usage
 -----
@@ -20,6 +21,12 @@ Usage
 
     # Re-encode to MP4 (one per camera)
     python tools/cli/parse_mcap.py video recording.mcap [--fps 30] [--out ./video]
+
+    # Inspect UDP packets
+    python tools/cli/parse_mcap.py udp recording.mcap [--stream radar_front] [--limit 20]
+
+    # Extract raw UDP payloads as .bin files
+    python tools/cli/parse_mcap.py udp recording.mcap --out ./udp_packets
 """
 
 from __future__ import annotations
@@ -95,6 +102,46 @@ def _iter_image_messages(
                 continue
 
             yield name, message.log_time, jpeg
+    finally:
+        fh.close()
+
+
+def _iter_udp_messages(
+    mcap_path: Path,
+    stream_filter: str | None = None,
+) -> Iterator[tuple[str, int, bytes]]:
+    """
+    Yield (stream_name, timestamp_ns, payload_bytes) for every
+    /udp/<name>/raw message in the MCAP.
+
+    Parameters
+    ----------
+    stream_filter: if given, only yield messages from that UDP stream name.
+    """
+    reader, fh = _open_reader(mcap_path)
+    try:
+        for schema, channel, message in reader.iter_messages():
+            topic: str = channel.topic  # e.g. "/udp/radar_front/raw"
+            if not topic.startswith("/udp/") or not topic.endswith("/raw"):
+                continue
+
+            parts = topic.split("/")  # ['', 'udp', 'radar_front', 'raw']
+            if len(parts) < 4:
+                continue
+            name = parts[2]
+
+            if stream_filter and name != stream_filter:
+                continue
+
+            try:
+                payload = json.loads(message.data)
+                b64 = payload["data"]
+                raw = base64.b64decode(b64)
+            except (KeyError, ValueError, Exception) as e:
+                print(f"  [WARN] Failed to decode UDP packet on {topic}: {e}", file=sys.stderr)
+                continue
+
+            yield name, message.log_time, raw
     finally:
         fh.close()
 
@@ -285,6 +332,61 @@ def cmd_video(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_udp(args: argparse.Namespace) -> None:
+    """Print and optionally extract raw UDP payloads from MCAP."""
+    mcap_path = Path(args.mcap)
+    if not mcap_path.exists():
+        print(f"ERROR: file not found: {mcap_path}")
+        sys.exit(1)
+
+    stream_filter: str | None = args.stream
+    out_root = Path(args.out) if args.out else None
+    if out_root:
+        out_root.mkdir(parents=True, exist_ok=True)
+
+    counts: dict[str, int] = {}
+    total_bytes = 0
+    total_packets = 0
+    max_packets = args.limit
+    hex_bytes = max(0, args.hex_bytes)
+
+    for name, ts_ns, payload in _iter_udp_messages(mcap_path, stream_filter):
+        idx = counts.get(name, 0)
+        counts[name] = idx + 1
+        total_packets += 1
+        total_bytes += len(payload)
+
+        if out_root:
+            stream_dir = out_root / name
+            stream_dir.mkdir(parents=True, exist_ok=True)
+            out_path = stream_dir / f"{ts_ns:020d}_{idx:06d}.bin"
+            out_path.write_bytes(payload)
+
+        if max_packets is None or total_packets <= max_packets:
+            preview = payload[:hex_bytes].hex() if hex_bytes > 0 else ""
+            line = f"[{total_packets:06d}] stream={name} ts_ns={ts_ns} size={len(payload)}"
+            if preview:
+                suffix = "..." if len(payload) > hex_bytes else ""
+                line += f" hex={preview}{suffix}"
+            print(line)
+
+    if not counts:
+        print("No UDP messages found (check --stream filter).")
+        sys.exit(1)
+
+    print()
+    print("UDP summary:")
+    for name, count in sorted(counts.items()):
+        print(f"  {name}: {count} packets")
+    print(f"  total: {total_packets} packets, {total_bytes} bytes")
+
+    if max_packets is not None and total_packets > max_packets:
+        print(f"  note: only first {max_packets} packets were printed")
+
+    if out_root:
+        print(f"  raw payloads written to: {out_root}")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -316,6 +418,18 @@ def build_parser() -> argparse.ArgumentParser:
     pv.add_argument("--out", default="./video",
                     help="Output directory (default: ./video)")
 
+    # udp
+    pu = sub.add_parser("udp", help="Print or extract raw UDP packets")
+    pu.add_argument("mcap", help="Path to .mcap file")
+    pu.add_argument("--stream", metavar="NAME",
+                    help="Only inspect this UDP stream (default: all)")
+    pu.add_argument("--limit", type=int, default=None,
+                    help="Only print the first N packets (default: all)")
+    pu.add_argument("--hex-bytes", type=int, default=16,
+                    help="Hex preview bytes per packet line (default: 16)")
+    pu.add_argument("--out", default=None,
+                    help="Optional output directory for raw .bin payloads")
+
     return p
 
 
@@ -327,6 +441,7 @@ def main() -> None:
         "info":   cmd_info,
         "frames": cmd_frames,
         "video":  cmd_video,
+        "udp":    cmd_udp,
     }
     dispatch[args.cmd](args)
 
