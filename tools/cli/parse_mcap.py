@@ -25,8 +25,8 @@ Usage
     # Inspect UDP packets
     python tools/cli/parse_mcap.py udp recording.mcap [--stream radar_front] [--limit 20]
 
-    # Extract raw UDP payloads as .bin files
-    python tools/cli/parse_mcap.py udp recording.mcap --out ./udp_packets
+    # Extract UDP payloads as .mudp files (one per stream)
+    python tools/cli/parse_mcap.py udp recording.mcap --out ./mudp
 """
 
 from __future__ import annotations
@@ -34,9 +34,10 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import struct
 import sys
 from pathlib import Path
-from typing import Iterator
+from typing import BinaryIO, Iterator
 
 # ── dependency checks ────────────────────────────────────────────────────────
 
@@ -333,7 +334,7 @@ def cmd_video(args: argparse.Namespace) -> None:
 
 
 def cmd_udp(args: argparse.Namespace) -> None:
-    """Print and optionally extract raw UDP payloads from MCAP."""
+    """Print UDP packets and optionally export them as .mudp files."""
     mcap_path = Path(args.mcap)
     if not mcap_path.exists():
         print(f"ERROR: file not found: {mcap_path}")
@@ -344,31 +345,44 @@ def cmd_udp(args: argparse.Namespace) -> None:
     if out_root:
         out_root.mkdir(parents=True, exist_ok=True)
 
+    mudp_files: dict[str, BinaryIO] = {}
+
     counts: dict[str, int] = {}
     total_bytes = 0
     total_packets = 0
     max_packets = args.limit
     hex_bytes = max(0, args.hex_bytes)
 
-    for name, ts_ns, payload in _iter_udp_messages(mcap_path, stream_filter):
-        idx = counts.get(name, 0)
-        counts[name] = idx + 1
-        total_packets += 1
-        total_bytes += len(payload)
+    try:
+        for name, ts_ns, payload in _iter_udp_messages(mcap_path, stream_filter):
+            idx = counts.get(name, 0)
+            counts[name] = idx + 1
+            total_packets += 1
+            total_bytes += len(payload)
 
-        if out_root:
-            stream_dir = out_root / name
-            stream_dir.mkdir(parents=True, exist_ok=True)
-            out_path = stream_dir / f"{ts_ns:020d}_{idx:06d}.bin"
-            out_path.write_bytes(payload)
+            if out_root:
+                fh = mudp_files.get(name)
+                if fh is None:
+                    out_path = out_root / f"{name}.mudp"
+                    fh = open(out_path, "wb")
+                    mudp_files[name] = fh
 
-        if max_packets is None or total_packets <= max_packets:
-            preview = payload[:hex_bytes].hex() if hex_bytes > 0 else ""
-            line = f"[{total_packets:06d}] stream={name} ts_ns={ts_ns} size={len(payload)}"
-            if preview:
-                suffix = "..." if len(payload) > hex_bytes else ""
-                line += f" hex={preview}{suffix}"
-            print(line)
+                # MudpLogHeader_T: first 8 bytes are timestamp(ms), little-endian.
+                # Then append raw UDP bytes; packet headers remain unchanged.
+                ts_ms = ts_ns // 1_000_000
+                fh.write(struct.pack("<Q", ts_ms))
+                fh.write(payload)
+
+            if max_packets is None or total_packets <= max_packets:
+                preview = payload[:hex_bytes].hex() if hex_bytes > 0 else ""
+                line = f"[{total_packets:06d}] stream={name} ts_ns={ts_ns} size={len(payload)}"
+                if preview:
+                    suffix = "..." if len(payload) > hex_bytes else ""
+                    line += f" hex={preview}{suffix}"
+                print(line)
+    finally:
+        for fh in mudp_files.values():
+            fh.close()
 
     if not counts:
         print("No UDP messages found (check --stream filter).")
@@ -384,7 +398,7 @@ def cmd_udp(args: argparse.Namespace) -> None:
         print(f"  note: only first {max_packets} packets were printed")
 
     if out_root:
-        print(f"  raw payloads written to: {out_root}")
+        print(f"  mudp files written to: {out_root}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -428,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--hex-bytes", type=int, default=16,
                     help="Hex preview bytes per packet line (default: 16)")
     pu.add_argument("--out", default=None,
-                    help="Optional output directory for raw .bin payloads")
+                    help="Optional output directory for .mudp files (one per stream)")
 
     return p
 
