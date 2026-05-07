@@ -8,7 +8,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 session:
-  output_dir: data/raw      # MCAP files land under data/raw/<YYYYMMDD>/<uuid>/
+  output_dir: /home/teto/workspace/embodied-ai-data-flywheel/data/raw      # MCAP files land under data/raw/<YYYYMMDD>/<uuid>/
   duration: 0               # Total recording seconds. 0 = run until Ctrl-C.
   segment_duration: 30      # Split MCAP every N seconds (0 = no splitting, single file).
   tags:
