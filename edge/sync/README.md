@@ -23,6 +23,12 @@ Two services are installed:
 
 Your capture program then timestamps camera/UDP data in `CLOCK_TAI` and records metadata in `session.manifest.json`.
 
+If the selected interface has no PTP Hardware Clock (common for USB Ethernet adapters), the installer falls back to software timestamping:
+
+- `ptp4l` runs in software mode
+- `edge-phc2sys.service` becomes a no-op placeholder
+- precision is lower than a true PHC-backed NIC
+
 ## 1) Install
 
 Run once on the capture machine:
@@ -45,6 +51,7 @@ Optional parameters:
 Notes:
 - `--transport` can be `UDPv4` or `L2`.
 - `--tai-offset` default `-37` matches current TAI-UTC leap-second offset assumption in code.
+- On interfaces without PHC, install will automatically switch to software timestamping.
 
 ## 2) Start
 
@@ -114,6 +121,7 @@ Also uninstall `linuxptp` package:
 1. Interface has no hardware timestamp support
 - Check `ethtool -T <iface>` output.
 - If hardware timestamps are unavailable, precision will be worse.
+- USB Ethernet adapters often fall into this category.
 
 2. Services are running but not locking
 - Confirm correct network interface connected to domain controller / GM.

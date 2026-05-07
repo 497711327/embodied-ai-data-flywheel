@@ -14,6 +14,9 @@ IFACE=""
 DOMAIN="0"
 TRANSPORT="UDPv4"
 TAI_OFFSET="-37"
+HAS_PHC=0
+TIMESTAMP_MODE="hardware"
+PTP4L_EXTRA_ARGS=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -72,7 +75,19 @@ sudo apt-get update
 sudo apt-get install -y linuxptp ethtool
 
 echo "[2/5] Checking timestamping capabilities on $IFACE..."
-ethtool -T "$IFACE" || true
+ETHTOOL_OUTPUT="$(ethtool -T "$IFACE" 2>/dev/null || true)"
+echo "$ETHTOOL_OUTPUT"
+
+if echo "$ETHTOOL_OUTPUT" | grep -Eq 'PTP Hardware Clock:[[:space:]]+[0-9]+'; then
+  HAS_PHC=1
+  TIMESTAMP_MODE="hardware"
+  PTP4L_EXTRA_ARGS=""
+else
+  HAS_PHC=0
+  TIMESTAMP_MODE="software"
+  PTP4L_EXTRA_ARGS="-S"
+  echo "INFO: no PHC detected on $IFACE, falling back to software timestamping"
+fi
 
 echo "[3/5] Writing ptp4l config..."
 PTP4L_CONF="/etc/linuxptp/edge-ptp4l-${IFACE}.conf"
@@ -81,10 +96,10 @@ sudo mkdir -p /etc/linuxptp
 sudo tee "$PTP4L_CONF" >/dev/null <<EOF
 [global]
 # Local node should lock to upstream GM.
-slaveOnly               1
+clientOnly              1
 domainNumber            ${DOMAIN}
 network_transport       ${TRANSPORT}
-time_stamping           hardware
+time_stamping           ${TIMESTAMP_MODE}
 
 # Conservative defaults for switched Ethernet.
 delay_mechanism         E2E
@@ -105,7 +120,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/ptp4l -f ${PTP4L_CONF} -i ${IFACE} -m -s
+ExecStart=/usr/sbin/ptp4l -f ${PTP4L_CONF} -i ${IFACE} -m -s ${PTP4L_EXTRA_ARGS}
 Restart=always
 RestartSec=2
 
@@ -113,6 +128,7 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
+if [[ "$HAS_PHC" -eq 1 ]]; then
 sudo tee /etc/systemd/system/edge-phc2sys.service >/dev/null <<EOF
 [Unit]
 Description=Edge PTP sync (phc2sys -> CLOCK_TAI)
@@ -128,6 +144,21 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF
+else
+sudo tee /etc/systemd/system/edge-phc2sys.service >/dev/null <<EOF
+[Unit]
+Description=Edge PTP sync (phc2sys skipped: no PHC on ${IFACE})
+After=edge-ptp4l.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -lc 'echo "Skipping phc2sys: interface ${IFACE} has no PHC; ptp4l is running in software timestamp mode"'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
 
 echo "[5/5] Enabling services..."
 sudo systemctl daemon-reload
@@ -139,6 +170,13 @@ echo "  ./sync/start_ptp.sh"
 echo "  ./sync/ptp_status.sh"
 echo "  ./sync/verify_capture_clock.sh"
 echo "  # remove later: ./sync/uninstall_ptp_services.sh --purge-config"
+echo
+if [[ "$HAS_PHC" -eq 1 ]]; then
+  echo "Mode: hardware timestamping (PHC detected)"
+else
+  echo "Mode: software timestamping (no PHC detected on $IFACE)"
+  echo "Accuracy will be lower than a real PTP-capable NIC; for best results use an Intel/i210-class NIC."
+fi
 echo
 echo "Services:"
 echo "  edge-ptp4l.service"
