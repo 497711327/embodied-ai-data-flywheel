@@ -49,7 +49,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import bisect
 import json
+import re
 import shutil
 import struct
 import subprocess
@@ -166,79 +168,57 @@ def _iter_udp_messages(
         fh.close()
 
 
-def _ass_time_from_ms(ms: int) -> str:
-    """Convert milliseconds to ASS timestamp format H:MM:SS.CS."""
-    if ms < 0:
-        ms = 0
-    cs = (ms % 1000) // 10
-    total_s = ms // 1000
-    s = total_s % 60
-    total_m = total_s // 60
-    m = total_m % 60
-    h = total_m // 60
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+def _collect_udp_timestamps_us(
+    mcap_path: Path,
+    stream_filter: str | None = None,
+) -> list[int]:
+    """Collect UDP log_time timestamps in microseconds for sync mapping."""
+    ts_us: list[int] = []
+    for _name, ts_ns, _payload in _iter_udp_messages(mcap_path, stream_filter):
+        ts_us.append(ts_ns // 1_000)
+    ts_us.sort()
+    return ts_us
 
 
-def _build_ass_lines(frame_ts_ns: list[int]) -> list[str]:
-    """Build ASS dialogue lines carrying Phoenix-style UTC text per frame.
-
-    ASS Start/End times are relative to the first frame so that the matroska
-    container reports the correct video duration.  The subtitle Text field
-    carries the absolute TAI millisecond timestamp so Phoenix can still read
-    wall-clock time from the subtitle stream.
-    """
-    if not frame_ts_ns:
+def _map_frame_ts_to_udp_us(frame_ts_ns: list[int], udp_ts_us: list[int]) -> list[int]:
+    """Map each frame timestamp to its nearest UDP timestamp (both in us)."""
+    if not frame_ts_ns or not udp_ts_us:
         return []
 
-    t0_ns = frame_ts_ns[0]  # recording-relative zero
-    lines: list[str] = []
-    # Use frame-to-frame delta for subtitle duration; clamp to at least 1 ms.
-    default_dur_ms = 33
+    mapped: list[int] = []
+    last = 0
+    for ts_ns in frame_ts_ns:
+        t_us = ts_ns // 1_000
+        i = bisect.bisect_left(udp_ts_us, t_us)
+        cand: list[int] = []
+        if i < len(udp_ts_us):
+            cand.append(udp_ts_us[i])
+        if i > 0:
+            cand.append(udp_ts_us[i - 1])
+        best = min(cand, key=lambda v: abs(v - t_us)) if cand else t_us
 
-    for i, ts_ns in enumerate(frame_ts_ns):
-        start_ms = (ts_ns - t0_ns) // 1_000_000   # relative, for ASS timing
-        abs_us = ts_ns // 1_000                    # absolute TAI microseconds - must match MUDP cantime unit
-        if i + 1 < len(frame_ts_ns):
-            next_ms = (frame_ts_ns[i + 1] - t0_ns) // 1_000_000
-            dur_ms = max(1, next_ms - start_ms)
-        else:
-            dur_ms = default_dur_ms
-        end_ms = start_ms + dur_ms
+        # Keep strictly non-decreasing subtitle UTC values.
+        if mapped and best < last:
+            best = last
+        mapped.append(best)
+        last = best
 
-        # Phoenix sync: Get_cantime() returns uint64_t timestamps (µs) from the
-        # MUDP header and passes it as time_stamp to the video decoder, which
-        # then looks for the subtitle frame whose UTC value matches.  Both must
-        # therefore use the same unit: microseconds.
-        lines.append(
-            f"Dialogue: 0,{_ass_time_from_ms(start_ms)},{_ass_time_from_ms(end_ms)},"
-            f"Default,,0,0,0,UTC:{abs_us}"
-        )
-
-    return lines
+    return mapped
 
 
-def _write_ass_file(path: Path, frame_ts_ns: list[int]) -> None:
-    header = [
-        "[Script Info]",
-        "ScriptType: v4.00+",
-        "",
-        "[V4+ Styles]",
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        "Style: Default,Arial,20,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1",
-        "",
-        "[Events]",
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Text",
-    ]
-    lines = header + _build_ass_lines(frame_ts_ns)
-    # Write UTF-8 BOM to mirror Phoenix subtitle packet behavior.
-    content = "\ufeff" + "\n".join(lines) + "\n"
-    path.write_text(content, encoding="utf-8")
+def _require_av():
+    try:
+        import av
+        return av
+    except ImportError:
+        print("ERROR: av package not installed.")
+        print("       Run: pip install av")
+        sys.exit(1)
 
 
-def _encode_phoenix_h264(
+def _encode_phoenix_h264_video_only(
     out_path: Path,
     frames_dir: Path,
-    ass_path: Path,
     fps: float,
 ) -> None:
     ffmpeg_bin = shutil.which("ffmpeg")
@@ -256,12 +236,6 @@ def _encode_phoenix_h264(
         f"{fps}",
         "-i",
         str(frames_dir / "%06d.jpg"),
-        "-i",
-        str(ass_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:s:0",
         "-c:v",
         "libx264",
         "-preset",
@@ -272,8 +246,6 @@ def _encode_phoenix_h264(
         "0",
         "-pix_fmt",
         "yuv420p",
-        "-c:s",
-        "ass",
         "-f",
         "matroska",
         str(out_path),
@@ -285,11 +257,110 @@ def _encode_phoenix_h264(
         sys.exit(1)
 
 
+def _ass_time_from_ms(ms: int) -> str:
+    """Convert milliseconds to Phoenix-style ASS timestamp format HH:MM:SS.CS."""
+    if ms < 0:
+        ms = 0
+    cs = (ms % 1000) // 10
+    total_s = ms // 1000
+    s = total_s % 60
+    total_m = total_s // 60
+    m = total_m % 60
+    h = total_m // 60
+    return f"{h:02d}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _phoenix_subtitle_header() -> bytes:
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        "Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,0",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _mux_phoenix_subtitles(
+    video_only_path: Path,
+    out_path: Path,
+    frame_ts_ns: list[int],
+    fps: float,
+    frame_sync_us: list[int] | None = None,
+) -> None:
+    av = _require_av()
+    from fractions import Fraction
+    from av.subtitles.subtitle import SubtitleSet
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        print("ERROR: ffmpeg not found. Install ffmpeg for Phoenix strict export.")
+        sys.exit(1)
+
+    sub_only_path = out_path.with_suffix(".subtmp.mkv")
+
+    sub_container = av.open(str(sub_only_path), "w", format="matroska")
+    try:
+        out_sub = sub_container.add_stream("ass")
+        out_sub.time_base = Fraction(1, 1000)
+        out_sub.codec_context.subtitle_header = _phoenix_subtitle_header()
+
+        for i, ts_ns in enumerate(frame_ts_ns):
+            start_ms = int(round(i * 1000.0 / fps))
+            end_ms = max(start_ms + 1, int(round((i + 1) * 1000.0 / fps)))
+            abs_us = frame_sync_us[i] if frame_sync_us and i < len(frame_sync_us) else (ts_ns // 1_000)
+            text = (
+                "\ufeff"
+                f"Dialogue: 0,{_ass_time_from_ms(start_ms)},{_ass_time_from_ms(end_ms)},"
+                f"Default,,0,0,0,UTC:{abs_us}"
+            ).encode("utf-8")
+            subtitle = SubtitleSet.create(text, 0, end_ms - start_ms, start_ms, 1)
+            packet = out_sub.codec_context.encode_subtitle(subtitle)
+            packet.stream = out_sub
+            sub_container.mux(packet)
+    finally:
+        sub_container.close()
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_only_path),
+        "-i",
+        str(sub_only_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:s:0",
+        "-c",
+        "copy",
+        "-f",
+        "matroska",
+        str(out_path),
+    ]
+
+    ret = subprocess.run(cmd, check=False)
+    if ret.returncode != 0:
+        print(f"ERROR: ffmpeg merge failed for {out_path}")
+        sys.exit(1)
+
+    try:
+        sub_only_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _cmd_video_phoenix_strict(
     mcap_path: Path,
     out_dir: Path,
     camera_filter: str | None,
     fps: float,
+    udp_stream_for_sync: str | None = None,
 ) -> None:
     """Export Phoenix-compatible videos: H264 + ASS subtitle in matroska container."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -304,6 +375,7 @@ def _cmd_video_phoenix_strict(
         sys.exit(1)
 
     camera_order = {name: idx for idx, name in enumerate(sorted(by_camera.keys()))}
+    udp_ts_us = _collect_udp_timestamps_us(mcap_path, udp_stream_for_sync)
 
     for name in sorted(by_camera.keys(), key=lambda n: camera_order[n]):
         frames = by_camera[name]
@@ -320,9 +392,17 @@ def _cmd_video_phoenix_strict(
                 (frames_dir / f"{idx:06d}.jpg").write_bytes(jpeg)
                 ts_ns_list.append(ts_ns)
 
-            ass_path = tmp_dir / "timestamps.ass"
-            _write_ass_file(ass_path, ts_ns_list)
-            _encode_phoenix_h264(out_path, frames_dir, ass_path, fps)
+            sync_ts_us = _map_frame_ts_to_udp_us(ts_ns_list, udp_ts_us) if udp_ts_us else None
+
+            video_only_path = tmp_dir / "video_only.mkv"
+            _encode_phoenix_h264_video_only(video_only_path, frames_dir, fps)
+            _mux_phoenix_subtitles(
+                video_only_path,
+                out_path,
+                ts_ns_list,
+                fps,
+                sync_ts_us,
+            )
 
         dur_s = (frames[-1][0] - frames[0][0]) / 1e9 if len(frames) > 1 else 0.0
         actual_fps = (len(frames) / dur_s) if dur_s > 0 else 0.0
@@ -468,13 +548,19 @@ def cmd_video(args: argparse.Namespace) -> None:
     # Phoenix replay requires H264 + subtitle stream in matroska container.
     # Keep this strict mode on for one-shot Phoenix export.
     if getattr(args, "phoenix_strict", False):
-        _cmd_video_phoenix_strict(mcap_path, out_dir, camera_filter, fps)
+        _cmd_video_phoenix_strict(
+            mcap_path,
+            out_dir,
+            camera_filter,
+            fps,
+            getattr(args, "udp_stream", None),
+        )
         return
 
     cv2 = _require_cv2()
 
     # Per-camera VideoWriter objects, created lazily on first frame.
-    writers: dict[str, cv2.VideoWriter] = {}
+    writers: dict[str, object] = {}
     frame_counts: dict[str, int] = {}
     start_times: dict[str, int] = {}
     end_times: dict[str, int] = {}
@@ -631,6 +717,7 @@ def cmd_phoenix(args: argparse.Namespace) -> None:
         out=str(video_out),
         phoenix_naming=True,
         phoenix_strict=True,
+        udp_stream=args.stream,
     ))
 
     print("\n[2/2] Exporting UDP as .mudp (timestamp in microseconds)...")
@@ -641,6 +728,28 @@ def cmd_phoenix(args: argparse.Namespace) -> None:
         hex_bytes=0,
         out=str(mudp_out),
     ))
+
+    # Phoenix auto-load expects matching basename in a single directory:
+    #   <base>.mudp + <base>_camera01.mp4
+    # Keep original /video and /udp outputs, and also materialize compatible
+    # copies at bundle root for direct "Open Log" usage in Phoenix.
+    mudp_files = sorted(mudp_out.glob("*.mudp"))
+    video_files = sorted(video_out.glob("*_camera*.mp4"))
+    if mudp_files and video_files:
+        print("\n[compat] Building Phoenix basename-linked files...")
+        copied = 0
+        for mudp_path in mudp_files:
+            base = mudp_path.stem
+            for vpath in video_files:
+                m = re.search(r"_camera(\d+)\.mp4$", vpath.name)
+                if not m:
+                    continue
+                cam_idx = m.group(1)
+                target = out_root / f"{base}_camera{cam_idx}.mp4"
+                shutil.copy2(vpath, target)
+                copied += 1
+            shutil.copy2(mudp_path, out_root / mudp_path.name)
+        print(f"  copied {copied} video file(s) and {len(mudp_files)} mudp file(s) to {out_root}")
 
     print("\nPhoenix bundle ready:")
     print(f"  video: {video_out}")
